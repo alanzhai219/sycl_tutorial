@@ -2,213 +2,110 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstddef>
 #include <iomanip>
 #include <iostream>
-#include <limits>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-namespace {
-
-constexpr std::size_t mib = 1024 * 1024;
-
-struct options {
-    std::size_t device = 0;
-    std::size_t array_mib = 256;
-    std::size_t iterations = 50;
-    std::size_t warmup = 5;
-    std::size_t local = 256;
-    bool list = false;
-    bool help = false;
-};
-
-std::size_t number(const std::string & text) {
-    if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
-        throw std::invalid_argument("Expected a non-negative integer: " + text);
-    }
-    const auto value = std::stoull(text);
-    if (value > std::numeric_limits<std::size_t>::max()) {
-        throw std::out_of_range("Integer exceeds size_t range");
-    }
-    return static_cast<std::size_t>(value);
-}
-
-options parse(int argc, char ** argv) {
-    options result;
-    for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
-        if (arg == "--help" || arg == "-h") {
-            result.help = true;
-        } else if (arg == "--list") {
-            result.list = true;
-        } else {
-            std::size_t * value = nullptr;
-            if (arg == "--device") value = &result.device;
-            else if (arg == "--mib") value = &result.array_mib;
-            else if (arg == "--iterations") value = &result.iterations;
-            else if (arg == "--warmup") value = &result.warmup;
-            else if (arg == "--local") value = &result.local;
-            else throw std::invalid_argument("Unknown option: " + arg);
-            if (++i == argc) throw std::invalid_argument("Missing value for " + arg);
-            *value = number(argv[i]);
-        }
-    }
-    if (result.array_mib == 0 || result.array_mib > std::numeric_limits<std::size_t>::max() / mib ||
-        result.iterations < 3 || result.iterations > 100000 || result.warmup > 100000 || result.local == 0) {
-        throw std::invalid_argument("Require MiB > 0, iterations in [3,100000], warmup <= 100000, local > 0");
-    }
-    return result;
-}
-
-void usage() {
-    std::cout << "SYCL GPU effective memory bandwidth (FP32)\n"
-              << "  --list                List GPU devices without allocating memory\n"
-              << "  --device INDEX        GPU index from --list (default 0)\n"
-              << "  --mib SIZE            MiB per array; three arrays (default 256)\n"
-              << "  --iterations COUNT    Timed runs per operation (default 50, minimum 3)\n"
-              << "  --warmup COUNT        Untimed runs per operation (default 5)\n"
-              << "  --local SIZE          Work-items per work-group (default 256)\n";
-}
-
-float input_b(std::size_t i) { return 2.0f + static_cast<float>(i % 17) * 0.0625f; }
-float input_c(std::size_t i) { return 3.0f + static_cast<float>(i % 13) * 0.0625f; }
-
-enum class operation { copy, add, triad };
-
-template<operation Op>
-sycl::event launch(sycl::queue & queue, float * a, const float * b, const float * c,
-                   std::size_t count, std::size_t global, std::size_t local) {
-    return queue.parallel_for(sycl::nd_range<1>{global, local}, [=](sycl::nd_item<1> item) {
-        const std::size_t i = item.get_global_linear_id();
-        if (i < count) {
-            if constexpr (Op == operation::copy) a[i] = b[i];
-            else if constexpr (Op == operation::add) a[i] = b[i] + c[i];
-            else a[i] = b[i] + 2.0f * c[i];
-        }
-    });
-}
-
-template<operation Op>
-void benchmark(const char * name, sycl::queue & queue, float * a, const float * b, const float * c,
-               std::size_t count, std::size_t global, const options & opt) {
-    for (std::size_t i = 0; i < opt.warmup; ++i) {
-        launch<Op>(queue, a, b, c, count, global, opt.local).wait_and_throw();
-    }
-
-    std::vector<double> seconds;
-    seconds.reserve(opt.iterations);
-    for (std::size_t i = 0; i < opt.iterations; ++i) {
-        sycl::event event = launch<Op>(queue, a, b, c, count, global, opt.local);
-        event.wait_and_throw();
-        const auto start = event.get_profiling_info<sycl::info::event_profiling::command_start>();
-        const auto end = event.get_profiling_info<sycl::info::event_profiling::command_end>();
-        if (end <= start) throw std::runtime_error("Invalid GPU profiling timestamps");
-        seconds.push_back(static_cast<double>(end - start) * 1e-9);
-    }
-
-    // Validate every output element in bounded host-side chunks, outside the timed interval.
-    std::vector<float> host(std::min(count, mib / sizeof(float)));
-    for (std::size_t offset = 0; offset < count; offset += host.size()) {
-        const std::size_t size = std::min(host.size(), count - offset);
-        queue.memcpy(host.data(), a + offset, size * sizeof(float)).wait_and_throw();
-        for (std::size_t j = 0; j < size; ++j) {
-            const std::size_t i = offset + j;
-            float expected = input_b(i);
-            if constexpr (Op == operation::add) expected += input_c(i);
-            if constexpr (Op == operation::triad) expected += 2.0f * input_c(i);
-            if (!std::isfinite(host[j]) || std::abs(host[j] - expected) > 1e-6f) {
-                throw std::runtime_error(std::string(name) + " validation failed at element " + std::to_string(i));
-            }
-        }
-    }
-
-    std::sort(seconds.begin(), seconds.end());
-    const std::size_t mid = seconds.size() / 2;
-    const double median = seconds.size() % 2 ? seconds[mid] : (seconds[mid - 1] + seconds[mid]) / 2;
-    const double bytes = static_cast<double>(count) * sizeof(float) * (Op == operation::copy ? 2 : 3);
-    std::cout << std::left << std::setw(10) << name << std::right << std::fixed << std::setprecision(3)
-              << std::setw(14) << median * 1e3
-              << std::setw(14) << bytes / median / 1e9
-              << std::setw(14) << bytes / seconds.front() / 1e9
-              << std::setw(14) << bytes / seconds.back() / 1e9
-              << "    PASS\n";
-}
-
-} // namespace
-
 int main(int argc, char ** argv) {
     try {
-        const options opt = parse(argc, argv);
-        if (opt.help) {
-            usage();
-            return 0;
-        }
         const auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-        if (devices.empty()) throw std::runtime_error("No SYCL GPU device found");
-        if (opt.list) {
+        if (devices.empty()) throw std::runtime_error("No SYCL GPU found");
+        if (argc == 1) {
+            std::cout << "Usage: " << argv[0] << " DEVICE_INDEX [MiB_PER_ARRAY=256]\n";
             for (std::size_t i = 0; i < devices.size(); ++i) {
-                std::cout << '[' << i << "] " << devices[i].get_info<sycl::info::device::name>()
-                          << " | " << devices[i].get_platform().get_info<sycl::info::platform::name>()
-                          << " | device USM: " << devices[i].has(sycl::aspect::usm_device_allocations)
-                          << " | shared USM: " << devices[i].has(sycl::aspect::usm_shared_allocations) << '\n';
+                std::cout << i << ": " << devices[i].get_info<sycl::info::device::name>()
+                          << " | " << devices[i].get_platform().get_info<sycl::info::platform::name>() << '\n';
             }
             return 0;
         }
-        if (opt.device >= devices.size()) throw std::invalid_argument("Device index out of range; use --list");
-        const auto device = devices[opt.device];
-        if (!device.has(sycl::aspect::usm_device_allocations) || !device.has(sycl::aspect::queue_profiling)) {
-            throw std::runtime_error("Device USM and queue profiling are required");
+        if (argc > 3) throw std::invalid_argument("Too many arguments");
+        auto integer = [](const std::string & text) {
+            if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
+                throw std::invalid_argument("Expected a non-negative integer");
+            }
+            return std::stoull(text);
+        };
+        const auto index = integer(argv[1]);
+        const auto size_mib = argc == 3 ? integer(argv[2]) : 256;
+        if (index >= devices.size() || size_mib == 0 || size_mib > 16384) {
+            throw std::invalid_argument("Invalid device index or array size (1..16384 MiB)");
         }
-        if (opt.local > device.get_info<sycl::info::device::max_work_group_size>() ||
-            opt.local > device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]) {
-            throw std::invalid_argument("Local size exceeds device limit");
-        }
-        const std::size_t bytes = opt.array_mib * mib;
+        const auto device = devices[index];
+        sycl::queue queue(device, {sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
+        const std::size_t bytes = static_cast<std::size_t>(size_mib) * 1024 * 1024;
+        const std::size_t n = bytes / sizeof(float);
         if (bytes > device.get_info<sycl::info::device::max_mem_alloc_size>() ||
             bytes > device.get_info<sycl::info::device::global_mem_size>() / 4) {
-            throw std::invalid_argument("Array too large: respect max allocation and keep three arrays <= 75% of device memory");
+            throw std::invalid_argument("Arrays too large for this device");
         }
-        const std::size_t count = bytes / sizeof(float);
-        if (opt.local - 1 > std::numeric_limits<std::size_t>::max() - count) {
-            throw std::invalid_argument("Rounded global size overflows size_t");
-        }
-        const std::size_t global = ((count + opt.local - 1) / opt.local) * opt.local;
-        sycl::queue queue(device, {sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
-        auto release = [&queue](float * ptr) { if (ptr) sycl::free(ptr, queue); };
-        using allocation = std::unique_ptr<float, decltype(release)>;
-        allocation a(sycl::malloc_device<float>(count, queue), release);
-        allocation b(sycl::malloc_device<float>(count, queue), release);
-        allocation c(sycl::malloc_device<float>(count, queue), release);
-        if (!a || !b || !c) throw std::runtime_error("Device allocation failed; reduce --mib");
-        float * ap = a.get();
-        float * bp = b.get();
-        float * cp = c.get();
-        queue.parallel_for(sycl::nd_range<1>{global, opt.local}, [=](sycl::nd_item<1> item) {
-            const std::size_t i = item.get_global_linear_id();
-            if (i < count) {
-                ap[i] = 0.0f;
-                bp[i] = 2.0f + static_cast<float>(i % 17) * 0.0625f;
-                cp[i] = 3.0f + static_cast<float>(i % 13) * 0.0625f;
-            }
-        }).wait_and_throw();
+        float * a = nullptr;
+        float * b = nullptr;
+        float * c = nullptr;
+        try {
+            a = sycl::malloc_device<float>(n, queue);
+            b = sycl::malloc_device<float>(n, queue);
+            c = sycl::malloc_device<float>(n, queue);
+            if (!a || !b || !c) throw std::runtime_error("Device allocation failed");
+            queue.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+                const std::size_t i = id[0];
+                a[i] = 0.0f;
+                b[i] = static_cast<float>(i % 1024);
+                c[i] = 1.0f;
+            }).wait_and_throw();
+            std::cout << "Device: " << device.get_info<sycl::info::device::name>()
+                      << "\nArrays: 3 x " << size_mib << " MiB; 5 warmups, 30 measured runs\n"
+                      << "Effective GB/s, not measured DRAM traffic. GPU event timing only.\n";
 
-        std::cout << "Device: " << device.get_info<sycl::info::device::name>()
-                  << "\nPlatform: " << device.get_platform().get_info<sycl::info::platform::name>()
-                  << "\nDriver: " << device.get_info<sycl::info::device::driver_version>()
-                  << "\nArrays: 3 x " << opt.array_mib << " MiB, elements/array: " << count
-                  << "\nIterations: " << opt.iterations << ", warmup: " << opt.warmup << ", local: " << opt.local
-                  << "\nGPU event timing; allocation, initialization and validation excluded."
-                  << "\nEffective GB/s (1 GB = 1e9 bytes), NOT measured DRAM traffic.\n\n"
-                  << std::left << std::setw(10) << "Operation" << std::right
-                  << std::setw(14) << "Median ms" << std::setw(14) << "Median GB/s"
-                  << std::setw(14) << "Best GB/s" << std::setw(14) << "Worst GB/s" << "    Validation\n";
-        benchmark<operation::copy>("Copy", queue, ap, bp, cp, count, global, opt);
-        benchmark<operation::add>("Add", queue, ap, bp, cp, count, global, opt);
-        benchmark<operation::triad>("Triad", queue, ap, bp, cp, count, global, opt);
-        queue.wait_and_throw();
+            auto measure = [&](const char * name, int streams, float offset, auto submit) {
+                for (int i = 0; i < 5; ++i) submit().wait_and_throw();
+                std::vector<double> times;
+                for (int i = 0; i < 30; ++i) {
+                    sycl::event event = submit();
+                    event.wait_and_throw();
+                    const auto start = event.get_profiling_info<sycl::info::event_profiling::command_start>();
+                    const auto end = event.get_profiling_info<sycl::info::event_profiling::command_end>();
+                    if (end <= start) throw std::runtime_error("Invalid GPU timestamps");
+                    times.push_back((end - start) * 1e-9);
+                }
+                std::sort(times.begin(), times.end());
+                const double seconds = (times[14] + times[15]) / 2;
+
+                // Validate outside the timed interval, using a small host buffer.
+                std::vector<float> host(std::min(n, std::size_t{262144}));
+                for (std::size_t base = 0; base < n; base += host.size()) {
+                    const std::size_t count = std::min(host.size(), n - base);
+                    queue.memcpy(host.data(), a + base, count * sizeof(float)).wait_and_throw();
+                    for (std::size_t j = 0; j < count; ++j) {
+                        const float expected = static_cast<float>((base + j) % 1024) + offset;
+                        if (!std::isfinite(host[j]) || host[j] != expected) {
+                            throw std::runtime_error(std::string(name) + " validation failed");
+                        }
+                    }
+                }
+                std::cout << std::fixed << std::setprecision(3) << name
+                          << ": " << seconds * 1000 << " ms, "
+                          << static_cast<double>(bytes) * streams / seconds / 1e9 << " GB/s, PASS\n";
+            };
+            measure("Copy  1r+1w", 2, 0.0f, [&] {
+                return queue.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { a[i] = b[i]; });
+            });
+            measure("Add   2r+1w", 3, 1.0f, [&] {
+                return queue.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { a[i] = b[i] + c[i]; });
+            });
+            measure("Triad 1r+2w", 3, 2.0f, [&] {
+                return queue.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { a[i] = b[i] + 2.0f * c[i]; });
+            });
+        } catch (...) {
+            if (a) sycl::free(a, queue);
+            if (b) sycl::free(b, queue);
+            if (c) sycl::free(c, queue);
+            throw;
+        }
+        sycl::free(a, queue);
+        sycl::free(b, queue);
+        sycl::free(c, queue);
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "Error: " << error.what() << '\n';
